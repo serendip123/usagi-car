@@ -1,0 +1,1060 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Usagicar - Three.js Viewer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            overflow: hidden;
+            background: #1a1a2e;
+        }
+        canvas {
+            display: block;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        ← → : 左右移動 | Space : ジャンプ | F : 花火 | B : バック<br>
+        ドラッグで回転 / スクロールでズーム
+    </div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+
+        // シーン
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB); // 空色
+        scene.fog = new THREE.Fog(0x87CEEB, 30, 80); // 遠くが霞む
+
+        // カメラ
+        const camera = new THREE.PerspectiveCamera(
+            45,
+            window.innerWidth / window.innerHeight,
+            0.1,
+            1000
+        );
+        camera.position.set(5, 3, 5);
+
+        // レンダラー
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 0.8;
+        document.body.appendChild(renderer.domElement);
+
+        // コントロール（車を中心に回転・ズーム）
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.minDistance = 2;
+        controls.maxDistance = 30;
+        controls.minPolarAngle = 0.1; // ほぼ真上から
+        controls.maxPolarAngle = Math.PI / 2 + 0.3; // 地面より下まで
+        controls.target.set(0, 1, 0);
+
+        // カメラ初期位置
+        camera.position.set(0, 4, 8);
+
+        // ゲーム状態
+        const gameState = {
+            direction: 0,        // 0: -Z(前進), 1: -X(左), 2: +Z, 3: +X(右) - 最初は-Z方向
+            targetDirection: 0,  // 目標方向
+            isJumping: false,
+            jumpVelocity: 0,
+            jumpHeight: 0,
+            isReversing: false,
+            baseY: 0,            // 地面の高さ
+            turnCooldown: 0,     // 連続ターン防止
+        };
+
+        // 花火システム（同心円状に広がる）
+        const fireworks = [];
+
+        function createFirework(position, direction) {
+            // 打ち上げ用のロケット（前方に発射）
+            const rocket = new THREE.Group();
+            rocket.userData = {
+                isRocket: true,
+                velocity: new THREE.Vector3(
+                    direction.x * 20,
+                    5,
+                    direction.z * 20
+                ),
+                direction: direction.clone(),
+                life: 0.8,
+                startPos: position.clone()
+            };
+            rocket.position.copy(position);
+
+            // ロケットの光
+            const rocketGeo = new THREE.SphereGeometry(0.15, 8, 8);
+            const rocketMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+            const rocketMesh = new THREE.Mesh(rocketGeo, rocketMat);
+            rocket.add(rocketMesh);
+
+            scene.add(rocket);
+            fireworks.push(rocket);
+        }
+
+        function createExplosion(position, direction) {
+            const colors = [0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xff00ff, 0x00ffff, 0xffd700, 0xff69b4];
+            const explosion = new THREE.Group();
+            explosion.userData = { isRocket: false, life: 2.5, position: position.clone() };
+
+            // 3段階の同心円（縦方向に広がる）
+            const rings = 3;
+            const particlesPerRing = 16;
+
+            for (let ring = 0; ring < rings; ring++) {
+                const ringColor = colors[Math.floor(Math.random() * colors.length)];
+                const ringSpeed = 3 + ring * 2;
+                const ringDelay = ring * 0.15;
+
+                for (let i = 0; i < particlesPerRing; i++) {
+                    const angle = (i / particlesPerRing) * Math.PI * 2;
+                    const geo = new THREE.SphereGeometry(0.12 - ring * 0.02, 6, 6);
+                    const mat = new THREE.MeshBasicMaterial({
+                        color: ringColor,
+                        transparent: true,
+                        opacity: 1
+                    });
+                    const particle = new THREE.Mesh(geo, mat);
+                    particle.position.copy(position);
+
+                    // 縦方向（垂直面）に円形に広がる
+                    // X軸方向とY軸方向に広がる（進行方向に対して垂直な面）
+                    particle.userData = {
+                        velocity: new THREE.Vector3(
+                            Math.cos(angle) * ringSpeed * Math.abs(direction.z),
+                            Math.sin(angle) * ringSpeed,
+                            Math.cos(angle) * ringSpeed * Math.abs(direction.x)
+                        ),
+                        delay: ringDelay,
+                        originalColor: ringColor
+                    };
+                    explosion.add(particle);
+                }
+            }
+
+            scene.add(explosion);
+            fireworks.push(explosion);
+        }
+
+        function updateFireworks(delta) {
+            for (let i = fireworks.length - 1; i >= 0; i--) {
+                const fw = fireworks[i];
+
+                if (fw.userData.isRocket) {
+                    // ロケットの更新
+                    fw.userData.life -= delta;
+                    fw.userData.velocity.y -= 2 * delta;
+                    fw.position.add(fw.userData.velocity.clone().multiplyScalar(delta));
+
+                    // 敵を倒す判定
+                    checkFireworkHit(fw.position);
+
+                    if (fw.userData.life <= 0) {
+                        // 爆発を生成
+                        createExplosion(fw.position.clone(), fw.userData.direction);
+                        // 爆発時も敵を倒す
+                        checkFireworkHit(fw.position, 8);
+                        scene.remove(fw);
+                        fw.children.forEach(c => {
+                            if (c.geometry) c.geometry.dispose();
+                            if (c.material) c.material.dispose();
+                        });
+                        fireworks.splice(i, 1);
+                    }
+                } else {
+                    // 爆発パーティクルの更新
+                    fw.userData.life -= delta;
+                    let allDead = fw.userData.life <= 0;
+
+                    fw.children.forEach(p => {
+                        if (p.userData.delay > 0) {
+                            p.userData.delay -= delta;
+                            p.visible = false;
+                        } else {
+                            p.visible = true;
+                            p.userData.velocity.y -= 2 * delta; // 軽い重力
+                            p.position.add(p.userData.velocity.clone().multiplyScalar(delta));
+                            p.material.opacity = Math.max(0, fw.userData.life / 2.5);
+                        }
+                    });
+
+                    if (allDead) {
+                        scene.remove(fw);
+                        fw.children.forEach(p => {
+                            p.geometry.dispose();
+                            p.material.dispose();
+                        });
+                        fireworks.splice(i, 1);
+                    }
+                }
+            }
+        }
+
+        // 敵システム（3種類）
+        const enemies = [];
+        const enemyTypes = [
+            { // タイプ1: 紫のトゲトゲ
+                color: 0x8b00ff,
+                geometry: () => new THREE.IcosahedronGeometry(0.8, 0),
+                scale: { x: 1, y: 1.5, z: 1 },
+                bobSpeed: 2,
+                rotateSpeed: 1
+            },
+            { // タイプ2: 赤黒の目玉
+                color: 0xff0000,
+                geometry: () => new THREE.SphereGeometry(0.6, 16, 16),
+                scale: { x: 1.2, y: 1, z: 1 },
+                bobSpeed: 3,
+                rotateSpeed: 0.5
+            },
+            { // タイプ3: 暗い緑のキューブ
+                color: 0x006400,
+                geometry: () => new THREE.BoxGeometry(1, 1, 1),
+                scale: { x: 1, y: 1, z: 1 },
+                bobSpeed: 1.5,
+                rotateSpeed: 2
+            }
+        ];
+
+        function createEnemy(x, z, type) {
+            const enemyType = enemyTypes[type];
+            const enemy = new THREE.Group();
+
+            const geo = enemyType.geometry();
+            const mat = new THREE.MeshStandardMaterial({
+                color: enemyType.color,
+                emissive: enemyType.color,
+                emissiveIntensity: 0.3,
+                roughness: 0.5
+            });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.scale.set(enemyType.scale.x, enemyType.scale.y, enemyType.scale.z);
+            enemy.add(mesh);
+
+            // タイプ2には目を追加
+            if (type === 1) {
+                const eyeGeo = new THREE.SphereGeometry(0.2, 8, 8);
+                const eyeMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+                const pupilGeo = new THREE.SphereGeometry(0.1, 8, 8);
+                const pupilMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+
+                const eye = new THREE.Mesh(eyeGeo, eyeMat);
+                eye.position.set(0, 0, 0.5);
+                const pupil = new THREE.Mesh(pupilGeo, pupilMat);
+                pupil.position.set(0, 0, 0.65);
+                enemy.add(eye, pupil);
+            }
+
+            enemy.position.set(x, 1.5, z);
+            enemy.userData = {
+                type: type,
+                bobSpeed: enemyType.bobSpeed,
+                rotateSpeed: enemyType.rotateSpeed,
+                phase: Math.random() * Math.PI * 2,
+                baseY: 1.5
+            };
+
+            scene.add(enemy);
+            enemies.push(enemy);
+            return enemy;
+        }
+
+        function updateEnemies(delta, carPos) {
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                const enemy = enemies[i];
+                enemy.userData.phase += delta * enemy.userData.bobSpeed;
+
+                // 上下に浮遊
+                enemy.position.y = enemy.userData.baseY + Math.sin(enemy.userData.phase) * 0.3;
+
+                // 回転
+                enemy.rotation.y += delta * enemy.userData.rotateSpeed;
+                enemy.rotation.x += delta * enemy.userData.rotateSpeed * 0.5;
+
+                // 車との距離が遠すぎたら削除
+                const dist = Math.sqrt(
+                    Math.pow(enemy.position.x - carPos.x, 2) +
+                    Math.pow(enemy.position.z - carPos.z, 2)
+                );
+                if (dist > 60) {
+                    scene.remove(enemy);
+                    enemy.children.forEach(c => {
+                        if (c.geometry) c.geometry.dispose();
+                        if (c.material) c.material.dispose();
+                    });
+                    enemies.splice(i, 1);
+                }
+            }
+        }
+
+        function checkEnemyCollision(carPos) {
+            for (const enemy of enemies) {
+                const dist = Math.sqrt(
+                    Math.pow(enemy.position.x - carPos.x, 2) +
+                    Math.pow(enemy.position.z - carPos.z, 2)
+                );
+                if (dist < 1.5) {
+                    return true; // 衝突
+                }
+            }
+            return false;
+        }
+
+        function checkFireworkHit(fireworkPos, radius = 2) {
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                const enemy = enemies[i];
+                const dist = Math.sqrt(
+                    Math.pow(enemy.position.x - fireworkPos.x, 2) +
+                    Math.pow(enemy.position.y - fireworkPos.y, 2) +
+                    Math.pow(enemy.position.z - fireworkPos.z, 2)
+                );
+                if (dist < radius) {
+                    // 敵を倒す（消滅エフェクト）
+                    scene.remove(enemy);
+                    enemy.children.forEach(c => {
+                        if (c.geometry) c.geometry.dispose();
+                        if (c.material) c.material.dispose();
+                    });
+                    enemies.splice(i, 1);
+                }
+            }
+        }
+
+        // 揺れ状態
+        let shakeTime = 0;
+        let shakeIntensity = 0;
+
+        // キーボード入力
+        const keys = {};
+        window.addEventListener('keydown', (e) => {
+            if (keys[e.code]) return; // リピート防止
+            keys[e.code] = true;
+
+            // 左に90度曲がる
+            if ((e.code === 'ArrowLeft' || e.code === 'KeyA') && gameState.turnCooldown <= 0) {
+                gameState.targetDirection = (gameState.direction + 1) % 4;
+                gameState.turnCooldown = 0.3;
+            }
+
+            // 右に90度曲がる
+            if ((e.code === 'ArrowRight' || e.code === 'KeyD') && gameState.turnCooldown <= 0) {
+                gameState.targetDirection = (gameState.direction + 3) % 4; // +3 = -1 mod 4
+                gameState.turnCooldown = 0.3;
+            }
+
+            // ジャンプ開始（大ジャンプ）
+            if (e.code === 'Space' && !gameState.isJumping) {
+                gameState.isJumping = true;
+                gameState.jumpVelocity = 80;
+            }
+
+            // 花火発射（進行方向に発射）
+            if (e.code === 'KeyF' && carModel) {
+                const angle = gameState.direction * Math.PI / 2;
+                const direction = new THREE.Vector3(-Math.sin(angle), 0, -Math.cos(angle));
+                const pos = carModel.position.clone();
+                pos.y += 1;
+                createFirework(pos, direction);
+            }
+
+            // バック切り替え
+            if (e.code === 'KeyB') {
+                gameState.isReversing = !gameState.isReversing;
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            keys[e.code] = false;
+        });
+
+        // 環境マップ用のPMREMGenerator
+        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+        pmremGenerator.compileEquirectangularShader();
+
+        // HDR環境マップの読み込み（Poly Havenから）
+        const rgbeLoader = new RGBELoader();
+        rgbeLoader.load(
+            'https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/studio_small_08_1k.hdr',
+            (texture) => {
+                const envMap = pmremGenerator.fromEquirectangular(texture).texture;
+                scene.environment = envMap;
+                // 背景にも環境マップを表示したい場合は以下をコメント解除
+                // scene.background = envMap;
+                texture.dispose();
+                pmremGenerator.dispose();
+                console.log('環境マップ読み込み完了');
+            }
+        );
+
+        // ライト（明るい昼間）
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const sunLight = new THREE.DirectionalLight(0xffffee, 1.2);
+        sunLight.position.set(10, 20, 10);
+        sunLight.castShadow = true;
+        sunLight.shadow.mapSize.width = 2048;
+        sunLight.shadow.mapSize.height = 2048;
+        sunLight.shadow.camera.near = 0.5;
+        sunLight.shadow.camera.far = 100;
+        sunLight.shadow.camera.left = -20;
+        sunLight.shadow.camera.right = 20;
+        sunLight.shadow.camera.top = 20;
+        sunLight.shadow.camera.bottom = -20;
+        scene.add(sunLight);
+        scene.add(sunLight.target);
+
+        // 無限地面システム
+        const tileSize = 20;
+        const tilesAhead = 4;
+        const tilesBehind = 2;
+        const groundTiles = new Map();
+
+        // マテリアル
+        const materials = {
+            road: new THREE.MeshStandardMaterial({ color: 0x555555, roughness: 0.9 }),
+            grass: new THREE.MeshStandardMaterial({ color: 0x4a8f4a, roughness: 0.95 }),
+            water: new THREE.MeshStandardMaterial({ color: 0x3498db, roughness: 0.1, metalness: 0.3, transparent: true, opacity: 0.8 }),
+            tree: new THREE.MeshStandardMaterial({ color: 0x2d5a27, roughness: 0.9 }),
+            trunk: new THREE.MeshStandardMaterial({ color: 0x5c4033, roughness: 0.95 }),
+            building: new THREE.MeshStandardMaterial({ color: 0xd4c4b0, roughness: 0.7 }),
+            roof: new THREE.MeshStandardMaterial({ color: 0x8b4513, roughness: 0.8 }),
+            flower: new THREE.MeshStandardMaterial({ color: 0xff6b9d, roughness: 0.8 }),
+        };
+
+        // 鳥システム（ユートピアなので明るい色）
+        const birds = [];
+        const birdGeometry = new THREE.ConeGeometry(0.1, 0.3, 4);
+        const birdColors = [0xff69b4, 0x00ffff, 0xffff00, 0xff8c00, 0x7fff00, 0xff1493];
+        const birdMaterial = new THREE.MeshStandardMaterial({ color: 0xff69b4 });
+
+        function createBird(z) {
+            const bird = new THREE.Group();
+            const birdColor = birdColors[Math.floor(Math.random() * birdColors.length)];
+            const bodyMat = new THREE.MeshStandardMaterial({ color: birdColor });
+            const body = new THREE.Mesh(birdGeometry, bodyMat);
+            body.rotation.x = Math.PI / 2;
+            bird.add(body);
+
+            // 翼（明るい色）
+            const wingGeo = new THREE.PlaneGeometry(0.4, 0.15);
+            const wingMat = new THREE.MeshStandardMaterial({ color: birdColor, side: THREE.DoubleSide });
+            const leftWing = new THREE.Mesh(wingGeo, wingMat);
+            leftWing.position.set(-0.2, 0, 0);
+            const rightWing = new THREE.Mesh(wingGeo, wingMat);
+            rightWing.position.set(0.2, 0, 0);
+            bird.add(leftWing, rightWing);
+            bird.userData = { leftWing, rightWing, phase: Math.random() * Math.PI * 2 };
+
+            bird.position.set(
+                (Math.random() - 0.5) * 30,
+                8 + Math.random() * 5,
+                z - Math.random() * 30
+            );
+            scene.add(bird);
+            birds.push(bird);
+            return bird;
+        }
+
+        function createTree(x, z) {
+            const group = new THREE.Group();
+            const height = 1.5 + Math.random() * 2;
+
+            // 幹
+            const trunkGeo = new THREE.CylinderGeometry(0.1, 0.15, height * 0.4, 6);
+            const trunk = new THREE.Mesh(trunkGeo, materials.trunk);
+            trunk.position.y = height * 0.2;
+            trunk.castShadow = true;
+            group.add(trunk);
+
+            // 葉（複数の球）
+            for (let i = 0; i < 3; i++) {
+                const leafGeo = new THREE.SphereGeometry(0.4 + Math.random() * 0.3, 6, 5);
+                const leaf = new THREE.Mesh(leafGeo, materials.tree);
+                leaf.position.set(
+                    (Math.random() - 0.5) * 0.3,
+                    height * 0.5 + i * 0.25,
+                    (Math.random() - 0.5) * 0.3
+                );
+                leaf.castShadow = true;
+                group.add(leaf);
+            }
+
+            group.position.set(x, 0, z);
+            return group;
+        }
+
+        function createBuilding(x, z) {
+            const group = new THREE.Group();
+            const width = 1.5 + Math.random() * 2;
+            const depth = 1.5 + Math.random() * 2;
+            const height = 2 + Math.random() * 4;
+
+            // 本体
+            const bodyGeo = new THREE.BoxGeometry(width, height, depth);
+            const body = new THREE.Mesh(bodyGeo, materials.building);
+            body.position.y = height / 2;
+            body.castShadow = true;
+            body.receiveShadow = true;
+            group.add(body);
+
+            // 屋根
+            const roofGeo = new THREE.ConeGeometry(Math.max(width, depth) * 0.8, 1.5, 4);
+            const roof = new THREE.Mesh(roofGeo, materials.roof);
+            roof.position.y = height + 0.75;
+            roof.rotation.y = Math.PI / 4;
+            roof.castShadow = true;
+            group.add(roof);
+
+            // 窓
+            const windowGeo = new THREE.PlaneGeometry(0.3, 0.4);
+            const windowMat = new THREE.MeshStandardMaterial({ color: 0x88ccff, emissive: 0x88ccff, emissiveIntensity: 0.2 });
+            for (let i = 0; i < 3; i++) {
+                const win = new THREE.Mesh(windowGeo, windowMat);
+                win.position.set(width / 2 + 0.01, 1 + i * 1.2, (Math.random() - 0.5) * depth * 0.5);
+                group.add(win);
+            }
+
+            group.position.set(x, 0, z);
+            return group;
+        }
+
+        function createLake(x, z) {
+            const group = new THREE.Group();
+            const size = 2 + Math.random() * 3;
+
+            // 水面
+            const waterGeo = new THREE.CircleGeometry(size, 16);
+            const water = new THREE.Mesh(waterGeo, materials.water);
+            water.rotation.x = -Math.PI / 2;
+            water.position.y = 0.02;
+            group.add(water);
+
+            // 周りに石
+            for (let i = 0; i < 6; i++) {
+                const angle = (i / 6) * Math.PI * 2;
+                const rockGeo = new THREE.DodecahedronGeometry(0.2 + Math.random() * 0.2, 0);
+                const rockMat = new THREE.MeshStandardMaterial({ color: 0x777777, roughness: 0.95 });
+                const rock = new THREE.Mesh(rockGeo, rockMat);
+                rock.position.set(
+                    Math.cos(angle) * size * 0.9,
+                    0.1,
+                    Math.sin(angle) * size * 0.9
+                );
+                rock.castShadow = true;
+                group.add(rock);
+            }
+
+            group.position.set(x, 0, z);
+            return group;
+        }
+
+        function createFlowerPatch(x, z) {
+            const group = new THREE.Group();
+            const colors = [0xff6b9d, 0xffeb3b, 0xff5722, 0x9c27b0, 0xffffff];
+
+            for (let i = 0; i < 8; i++) {
+                const flowerGeo = new THREE.SphereGeometry(0.08, 6, 5);
+                const flowerMat = new THREE.MeshStandardMaterial({
+                    color: colors[Math.floor(Math.random() * colors.length)]
+                });
+                const flower = new THREE.Mesh(flowerGeo, flowerMat);
+                flower.position.set(
+                    (Math.random() - 0.5) * 1.5,
+                    0.15,
+                    (Math.random() - 0.5) * 1.5
+                );
+                group.add(flower);
+            }
+
+            group.position.set(x, 0, z);
+            return group;
+        }
+
+        // グリッドベースのタイルシステム
+        // キー: "x,z" 形式の文字列
+        function getTileKey(tileX, tileZ) {
+            return `${tileX},${tileZ}`;
+        }
+
+        function createGroundTile(tileX, tileZ, roadDir, roadPos) {
+            const objects = [];
+            const worldX = tileX * tileSize;
+            const worldZ = tileZ * tileSize;
+
+            // 芝生ベース
+            const grassGeo = new THREE.PlaneGeometry(tileSize, tileSize);
+            const grass = new THREE.Mesh(grassGeo, materials.grass);
+            grass.rotation.x = -Math.PI / 2;
+            grass.position.set(worldX, 0, worldZ);
+            grass.receiveShadow = true;
+            scene.add(grass);
+            objects.push(grass);
+
+            // 道路を生成（車の進行方向に沿って）
+            // roadDir: 0 = Z方向, 1 = X方向
+            // roadPos: 道路の位置（道路と垂直な軸での位置）
+            const isZRoad = (roadDir === 0 || roadDir === 2);
+
+            if (isZRoad) {
+                // Z方向の道路
+                const roadGeo = new THREE.PlaneGeometry(3, tileSize);
+                const road = new THREE.Mesh(roadGeo, materials.road);
+                road.rotation.x = -Math.PI / 2;
+                road.position.set(roadPos, 0.01, worldZ);
+                road.receiveShadow = true;
+                scene.add(road);
+                objects.push(road);
+
+                // 白線
+                for (let i = 0; i < 3; i++) {
+                    const lineGeo = new THREE.PlaneGeometry(0.1, 2);
+                    const line = new THREE.Mesh(lineGeo, new THREE.MeshStandardMaterial({ color: 0xffffff }));
+                    line.rotation.x = -Math.PI / 2;
+                    line.position.set(roadPos, 0.02, worldZ + (i - 1) * 5);
+                    scene.add(line);
+                    objects.push(line);
+                }
+            } else {
+                // X方向の道路
+                const roadGeo = new THREE.PlaneGeometry(tileSize, 3);
+                const road = new THREE.Mesh(roadGeo, materials.road);
+                road.rotation.x = -Math.PI / 2;
+                road.position.set(worldX, 0.01, roadPos);
+                road.receiveShadow = true;
+                scene.add(road);
+                objects.push(road);
+
+                // 白線
+                for (let i = 0; i < 3; i++) {
+                    const lineGeo = new THREE.PlaneGeometry(2, 0.1);
+                    const line = new THREE.Mesh(lineGeo, new THREE.MeshStandardMaterial({ color: 0xffffff }));
+                    line.rotation.x = -Math.PI / 2;
+                    line.position.set(worldX + (i - 1) * 5, 0.02, roadPos);
+                    scene.add(line);
+                    objects.push(line);
+                }
+            }
+
+            // 障害物配置（道路を避ける）
+            for (let i = 0; i < 3 + Math.floor(Math.random() * 3); i++) {
+                let x, z;
+                let attempts = 0;
+                do {
+                    x = worldX + (Math.random() - 0.5) * tileSize * 0.9;
+                    z = worldZ + (Math.random() - 0.5) * tileSize * 0.9;
+                    attempts++;
+                } while (attempts < 10 && (
+                    (isZRoad && Math.abs(x - roadPos) < 2.5) ||
+                    (!isZRoad && Math.abs(z - roadPos) < 2.5)
+                ));
+
+                if (attempts < 10) {
+                    const tree = createTree(x, z);
+                    scene.add(tree);
+                    objects.push(tree);
+                }
+            }
+
+            // 建物
+            if (Math.random() < 0.3) {
+                let x, z;
+                let attempts = 0;
+                do {
+                    x = worldX + (Math.random() - 0.5) * tileSize * 0.7;
+                    z = worldZ + (Math.random() - 0.5) * tileSize * 0.7;
+                    attempts++;
+                } while (attempts < 10 && (
+                    (isZRoad && Math.abs(x - roadPos) < 4) ||
+                    (!isZRoad && Math.abs(z - roadPos) < 4)
+                ));
+
+                if (attempts < 10) {
+                    const building = createBuilding(x, z);
+                    scene.add(building);
+                    objects.push(building);
+                }
+            }
+
+            // 湖
+            if (Math.random() < 0.15) {
+                let x, z;
+                let attempts = 0;
+                do {
+                    x = worldX + (Math.random() - 0.5) * tileSize * 0.6;
+                    z = worldZ + (Math.random() - 0.5) * tileSize * 0.6;
+                    attempts++;
+                } while (attempts < 10 && (
+                    (isZRoad && Math.abs(x - roadPos) < 5) ||
+                    (!isZRoad && Math.abs(z - roadPos) < 5)
+                ));
+
+                if (attempts < 10) {
+                    const lake = createLake(x, z);
+                    scene.add(lake);
+                    objects.push(lake);
+                }
+            }
+
+            // 花畑
+            if (Math.random() < 0.4) {
+                const side = Math.random() > 0.5 ? 2.5 : -2.5;
+                let fx, fz;
+                if (isZRoad) {
+                    fx = roadPos + side;
+                    fz = worldZ + (Math.random() - 0.5) * tileSize * 0.8;
+                } else {
+                    fx = worldX + (Math.random() - 0.5) * tileSize * 0.8;
+                    fz = roadPos + side;
+                }
+                const flowers = createFlowerPatch(fx, fz);
+                scene.add(flowers);
+                objects.push(flowers);
+            }
+
+            // 鳥
+            if (Math.random() < 0.2) {
+                createBird(worldZ);
+            }
+
+            // 敵（確率で出現）
+            if (Math.random() < 0.25) {
+                const enemyType = Math.floor(Math.random() * 3);
+                let ex, ez;
+                // 道路上または道路近くに出現
+                if (isZRoad) {
+                    ex = roadPos + (Math.random() - 0.5) * 4;
+                    ez = worldZ + (Math.random() - 0.5) * tileSize * 0.8;
+                } else {
+                    ex = worldX + (Math.random() - 0.5) * tileSize * 0.8;
+                    ez = roadPos + (Math.random() - 0.5) * 4;
+                }
+                createEnemy(ex, ez, enemyType);
+            }
+
+            return { objects };
+        }
+
+        function disposeObject(obj) {
+            if (obj.geometry) obj.geometry.dispose();
+            if (obj.material) {
+                if (Array.isArray(obj.material)) {
+                    obj.material.forEach(m => m.dispose());
+                }
+            }
+            if (obj.children) {
+                obj.children.forEach(child => disposeObject(child));
+            }
+        }
+
+        function updateGround(carX, carZ, direction) {
+            const currentTileX = Math.floor(carX / tileSize);
+            const currentTileZ = Math.floor(carZ / tileSize);
+
+            // 車の周囲のタイルを生成
+            const range = 3;
+            for (let dx = -range; dx <= range; dx++) {
+                for (let dz = -range; dz <= range; dz++) {
+                    const tx = currentTileX + dx;
+                    const tz = currentTileZ + dz;
+                    const key = getTileKey(tx, tz);
+
+                    if (!groundTiles.has(key)) {
+                        // 道路の方向と位置を決定
+                        const roadDir = direction;
+                        let roadPos;
+                        if (direction === 0 || direction === 2) {
+                            // Z方向に進んでいる：道路はX位置
+                            roadPos = carX;
+                        } else {
+                            // X方向に進んでいる：道路はZ位置
+                            roadPos = carZ;
+                        }
+                        groundTiles.set(key, createGroundTile(tx, tz, roadDir, roadPos));
+                    }
+                }
+            }
+
+            // 遠いタイルを削除
+            const maxDist = (range + 2) * tileSize;
+            for (const [key, data] of groundTiles) {
+                const [tx, tz] = key.split(',').map(Number);
+                const worldX = tx * tileSize;
+                const worldZ = tz * tileSize;
+                const dist = Math.max(Math.abs(worldX - carX), Math.abs(worldZ - carZ));
+
+                if (dist > maxDist) {
+                    data.objects.forEach(obj => {
+                        scene.remove(obj);
+                        disposeObject(obj);
+                    });
+                    groundTiles.delete(key);
+                }
+            }
+
+            // 古い鳥を削除
+            for (let i = birds.length - 1; i >= 0; i--) {
+                const birdDist = Math.sqrt(
+                    Math.pow(birds[i].position.x - carX, 2) +
+                    Math.pow(birds[i].position.z - carZ, 2)
+                );
+                if (birdDist > 50) {
+                    scene.remove(birds[i]);
+                    birds.splice(i, 1);
+                }
+            }
+        }
+
+        // 鳥のアニメーション
+        function updateBirds(delta, carZ) {
+            birds.forEach(bird => {
+                bird.position.z -= 3 * delta; // 前に飛ぶ
+                bird.position.x += Math.sin(bird.userData.phase) * 0.02;
+                bird.userData.phase += delta * 5;
+
+                // 羽ばたき
+                const wingAngle = Math.sin(bird.userData.phase * 3) * 0.5;
+                bird.userData.leftWing.rotation.z = wingAngle;
+                bird.userData.rightWing.rotation.z = -wingAngle;
+            });
+        }
+
+        // 初期地面を生成（direction 0 = -Z方向）
+        updateGround(0, 0, 0);
+
+        // アニメーション用
+        let mixer = null;
+        let carModel = null;
+        const clock = new THREE.Clock();
+        const moveSpeed = 3; // 前進速度
+
+        // GLBモデルの読み込み
+        const loader = new GLTFLoader();
+        loader.load(
+            'usagicar.glb',
+            (gltf) => {
+                const model = gltf.scene;
+
+                // モデルの中心とサイズを計算
+                const box = new THREE.Box3().setFromObject(model);
+                const center = box.getCenter(new THREE.Vector3());
+                const size = box.getSize(new THREE.Vector3());
+
+                // モデルを中心に配置
+                model.position.sub(center);
+                model.position.y += size.y / 2;
+
+                // 影の設定 & 環境マップの適用
+                model.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                        // マテリアルの環境マップ強度を上げる
+                        if (child.material) {
+                            child.material.envMapIntensity = 1.5;
+                        }
+                    }
+                });
+
+                scene.add(model);
+                carModel = model;
+                gameState.baseY = model.position.y;
+
+                // アニメーションの設定
+                if (gltf.animations && gltf.animations.length > 0) {
+                    mixer = new THREE.AnimationMixer(model);
+
+                    console.log('利用可能なアニメーション:');
+                    gltf.animations.forEach((clip, index) => {
+                        console.log(`  ${index}: ${clip.name}`);
+                    });
+
+                    // Back以外のアニメーションを再生
+                    const filteredAnimations = gltf.animations.filter(
+                        clip => !clip.name.includes('Back')
+                    );
+
+                    console.log('再生するアニメーション:');
+                    filteredAnimations.forEach((clip) => {
+                        console.log(`  - ${clip.name}`);
+                        const action = mixer.clipAction(clip);
+                        action.play();
+                    });
+
+                    console.log(`${filteredAnimations.length}個のアニメーションを再生中`);
+                } else {
+                    console.log('アニメーションが見つかりません');
+                }
+
+                // カメラ初期位置
+                camera.position.set(0, 4, 8);
+
+                console.log('モデル読み込み完了:', gltf);
+            },
+            (progress) => {
+                const percent = (progress.loaded / progress.total * 100).toFixed(1);
+                console.log(`読み込み中: ${percent}%`);
+            },
+            (error) => {
+                console.error('モデル読み込みエラー:', error);
+            }
+        );
+
+        // ウィンドウリサイズ対応
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // アニメーションループ
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            if (mixer) {
+                mixer.update(delta);
+            }
+
+            // モデルを前進/後退させる
+            if (carModel) {
+                // ターンクールダウン
+                if (gameState.turnCooldown > 0) {
+                    gameState.turnCooldown -= delta;
+                }
+
+                // 方向の補間（スムーズに曲がる）
+                if (gameState.direction !== gameState.targetDirection) {
+                    gameState.direction = gameState.targetDirection;
+                }
+
+                // 進行方向に基づいて移動
+                // direction: 0 = -Z, 1 = -X, 2 = +Z, 3 = +X
+                const angle = gameState.direction * Math.PI / 2;
+                const forward = gameState.isReversing ? -1 : 1;
+                const speed = moveSpeed * forward;
+
+                // 方向ベクトル
+                const dirX = -Math.sin(angle);
+                const dirZ = -Math.cos(angle);
+
+                carModel.position.x += dirX * speed * delta;
+                carModel.position.z += dirZ * speed * delta;
+
+                // ジャンプ処理（超ソフトランディング）
+                if (gameState.isJumping) {
+                    // 上昇中は普通の重力
+                    if (gameState.jumpVelocity > 0) {
+                        gameState.jumpVelocity -= 50 * delta;
+                    } else {
+                        // 下降中は高度に応じて重力を弱める
+                        const softness = Math.max(0.1, gameState.jumpHeight / 50);
+                        gameState.jumpVelocity -= 10 * softness * delta;
+
+                        // 最低落下速度を制限（ふわふわ）
+                        gameState.jumpVelocity = Math.max(gameState.jumpVelocity, -8);
+                    }
+
+                    gameState.jumpHeight += gameState.jumpVelocity * delta;
+
+                    if (gameState.jumpHeight <= 0) {
+                        gameState.jumpHeight = 0;
+                        gameState.isJumping = false;
+                        gameState.jumpVelocity = 0;
+                    }
+                }
+
+                // Y位置を更新（ベース + ジャンプ）
+                carModel.position.y = gameState.baseY + gameState.jumpHeight;
+
+                // 車の回転（進行方向を向く）
+                carModel.rotation.y = angle;
+
+                // 地面を更新
+                updateGround(carModel.position.x, carModel.position.z, gameState.direction);
+
+                // コントロールのターゲットを車に追従
+                controls.target.set(
+                    carModel.position.x,
+                    carModel.position.y + 1,
+                    carModel.position.z
+                );
+
+                // ライトも追従
+                sunLight.position.set(
+                    carModel.position.x + 10,
+                    20,
+                    carModel.position.z + 10
+                );
+                sunLight.target.position.copy(carModel.position);
+            }
+
+            // 花火更新
+            updateFireworks(delta);
+
+            // 敵の更新
+            if (carModel) {
+                updateEnemies(delta, carModel.position);
+
+                // 敵との衝突判定
+                if (checkEnemyCollision(carModel.position)) {
+                    shakeTime = 0.5;
+                    shakeIntensity = 0.3;
+                }
+            }
+
+            // 揺れ処理
+            if (shakeTime > 0) {
+                shakeTime -= delta;
+                const shake = shakeIntensity * (shakeTime / 0.5);
+                camera.position.x += (Math.random() - 0.5) * shake;
+                camera.position.y += (Math.random() - 0.5) * shake;
+            }
+
+            // 鳥のアニメーション
+            updateBirds(delta, carModel ? carModel.position.z : 0);
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>
