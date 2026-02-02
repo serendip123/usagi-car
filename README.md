@@ -68,7 +68,6 @@ npx serve
 usagi-car/
 ├── index.html       # メインのゲームファイル
 ├── usagicar.glb     # うさぎ車の3Dモデル
-├── usagicar.blend   # Blenderソースファイル
 └── README.md        # このファイル
 ```
 
