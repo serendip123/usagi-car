@@ -906,7 +906,7 @@
                         console.log(`  ${index}: ${clip.name}`);
                     });
 
-                    // Back以外のアニメーションを再生
+                    // Back を除外
                     const filteredAnimations = gltf.animations.filter(
                         clip => !clip.name.includes('Back')
                     );
